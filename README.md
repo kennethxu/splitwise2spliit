@@ -1,8 +1,7 @@
-# Spliit utility scripts
+# splitwise2spliit
 
-Small scripts for bulk-managing expenses in a [Spliit](https://spliit.app)
-group (the open-source Splitwise alternative), built around a shared
-`spliit_api.py` client module.
+Utility script to import Splitwise exported CSV file into an existing [Spliit](https://spliit.app)
+group.
 
 ## Files
 
