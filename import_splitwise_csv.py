@@ -26,6 +26,14 @@ those deltas -- see `parse_expenses()`. Spliit only supports a single payer
 per expense, so rows with more than one positive value (split payments) are
 skipped with a warning rather than guessed at.
 
+Rows whose Category is "Payment" are Splitwise settle-up transactions (one
+person directly repaying another), not real expenses. These are imported as
+Spliit reimbursements (isReimbursement=True) rather than ordinary expenses,
+so they net out balances the same way instead of showing up as a purchase.
+spliit_client's add_expense() always sends isReimbursement=False with no way
+to override it, so this script posts those rows to the API itself -- see
+`create_expense()`.
+
 Two refinements on top of the raw reconstruction:
   1. Participants whose computed share comes out to (effectively) zero are
      dropped from the split entirely, rather than being sent as a $0 share.
@@ -35,14 +43,15 @@ Two refinements on top of the raw reconstruction:
      rounding drift across cents).
 
 Category mapping: Splitwise category names are mapped to Spliit category
-names via CATEGORY_NAME_MAP plus category_mapping.json (created next to
-this script). The first time an unrecognized Splitwise category shows up,
-you're prompted interactively to pick the matching Spliit category; that
-choice is saved to category_mapping.json immediately, so future runs (with
-that same Splitwise category) use it automatically without asking again.
+names via category_mapping.json (created next to this script -- see the
+category_mapping.json this project already generated, which covers every
+standard Splitwise/Spliit category). The first time a Splitwise category
+not in that file shows up, you're prompted interactively to pick the
+matching Spliit category; that choice is saved to category_mapping.json
+immediately, so future runs use it automatically without asking again.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import argparse
 import csv
 import json
@@ -53,17 +62,17 @@ from spliit_client import Spliit, SplitMode
 
 DEFAULT_SERVER_URL = "https://spliit.app"
 
-# Seed mappings for Splitwise category names -> Spliit category names where
-# they differ. These are the starting point; anything learned interactively
-# (see resolve_category/prompt_for_category) is persisted to
-# CATEGORY_MAPPING_FILE and merged on top of these on every run, so you're
-# only ever prompted once per new Splitwise category name.
-CATEGORY_NAME_MAP = { }
 CATEGORY_MAPPING_FILE = "category_mapping.json"
 
-# Shares within this many dollars of each other are treated as "equal"
-# (covers float/rounding noise like 307.865 vs 307.8650000000001).
-EQUAL_SHARE_TOLERANCE = 0.01
+# A spread of at most this many cents between participants' shares is
+# treated as an even split. Splitting a cost evenly across N people almost
+# never divides exactly -- the leftover 1-2 cents get distributed to some
+# participants and not others -- so a 1-cent spread is the normal signature
+# of an even split, not an intentionally uneven one. Comparing at the cent
+# level (integers) also avoids floating-point boundary noise: dollar values
+# like 9.83 - 9.82 can round to just above or just below a 0.01 threshold
+# depending on which floats were subtracted, misclassifying identical splits.
+EQUAL_SHARE_SPREAD_CENTS = 1
 # A computed share smaller than this (in dollars) is treated as zero and
 # the participant is dropped from the split.
 ZERO_SHARE_TOLERANCE = 0.005
@@ -78,14 +87,66 @@ def get_categories(server_url: str = DEFAULT_SERVER_URL) -> dict:
     return {c["name"]: c["id"] for c in payload["categories"]}
 
 
+def create_expense(client: Spliit, title: str, amount: int, paid_by: str,
+                    paid_for: list, split_mode: SplitMode,
+                    expense_date: datetime = None, notes: str = "",
+                    category: int = 0, is_reimbursement: bool = False) -> str:
+    """
+    Add an expense, or a settlement payment when is_reimbursement=True.
+
+    This mirrors spliit_client.Spliit.add_expense() exactly, with one
+    difference: that method hardcodes isReimbursement=False in the request
+    it sends, with no parameter to change it, so a settle-up payment can't
+    be created through it. This posts the same request directly, letting
+    is_reimbursement flow through.
+    """
+    if expense_date is None:
+        expense_date = datetime.now(timezone.utc)
+
+    formatted_paid_for = [{"participant": pid, "shares": shares} for pid, shares in paid_for]
+    formatted_date = (expense_date.strftime("%Y-%m-%dT%H:%M:%S.")
+                      + f"{expense_date.microsecond // 10000:03d}Z")
+
+    expense_form_values = {
+        "expenseDate": formatted_date,
+        "title": title,
+        "category": category,
+        "amount": amount,
+        "paidBy": paid_by,
+        "paidFor": formatted_paid_for,
+        "splitMode": split_mode.value,
+        "saveDefaultSplittingOptions": False,
+        "isReimbursement": is_reimbursement,
+        "documents": [],
+        "notes": notes,
+    }
+    json_data = {
+        "0": {
+            "json": {
+                "groupId": client.group_id,
+                "expenseFormValues": expense_form_values,
+                "participantId": "None",
+            },
+            "meta": {"values": {"expenseFormValues.expenseDate": ["Date"]}},
+        }
+    }
+
+    resp = requests.post(f"{client.base_url}/groups.expenses.create",
+                          params={"batch": "1"}, json=json_data)
+    resp.raise_for_status()
+    return resp.content.decode()
+
+
 def load_category_mapping(path: str = CATEGORY_MAPPING_FILE) -> dict:
-    """Start from the built-in CATEGORY_NAME_MAP, then layer on anything
-    already learned and saved to `path` from a previous run."""
-    mapping = dict(CATEGORY_NAME_MAP)
+    """Load the Splitwise -> Spliit category name mapping from `path`
+    (created by prompt_for_category/resolve_category as new categories are
+    encountered, or pre-populated by hand). Returns an empty mapping if the
+    file doesn't exist yet -- every category will then be prompted for on
+    first use and saved from there."""
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
-            mapping.update(json.load(f))
-    return mapping
+            return json.load(f)
+    return {}
 
 
 def save_category_mapping(mapping: dict, path: str = CATEGORY_MAPPING_FILE) -> None:
@@ -141,7 +202,7 @@ def parse_expenses(csv_path: str):
 
     Each yielded dict has:
         date, description, category, cost_cents, payer_name,
-        split_mode ("EVENLY" or "BY_AMOUNT"),
+        split_mode ("EVENLY" or "BY_AMOUNT"), is_reimbursement,
         shares: {participant_name: value}
             - for EVENLY, value is a weight (1 for everyone, ignored by
               Spliit -- it just needs to be present and nonzero)
@@ -203,10 +264,11 @@ def parse_expenses(csv_path: str):
                 continue
 
             cost_cents = round(cost * 100)
-            values = list(raw_shares.values())
+            values_cents = {n: round(s * 100) for n, s in raw_shares.items()}
 
-            # (2) equal shares -> EVENLY, otherwise exact BY_AMOUNT split
-            if max(values) - min(values) < EQUAL_SHARE_TOLERANCE:
+            # (2) equal (within a cent) -> EVENLY, otherwise exact BY_AMOUNT split
+            spread = max(values_cents.values()) - min(values_cents.values())
+            if spread <= EQUAL_SHARE_SPREAD_CENTS:
                 split_mode = "EVENLY"
                 shares = {n: 1 for n in raw_shares}
             else:
@@ -226,6 +288,7 @@ def parse_expenses(csv_path: str):
                 "cost_cents": cost_cents,
                 "payer_name": payer_name,
                 "split_mode": split_mode,
+                "is_reimbursement": category.strip().lower() == "payment",
                 "shares": shares,
             }
 
@@ -250,9 +313,10 @@ def main():
 
     created, skipped = 0, 0
     for expense in parse_expenses(args.csv_path):
+        label = f"{expense['description']!r} (${expense['cost_cents'] / 100:.2f})"
         payer_id = participants.get(expense["payer_name"])
         if payer_id is None:
-            print(f"  Skipping {expense['description']!r}: unknown payer "
+            print(f"  Skipping {expense['date'].date()} {label}: unknown payer "
                   f"{expense['payer_name']!r}")
             skipped += 1
             continue
@@ -261,7 +325,7 @@ def main():
         for name, value in expense["shares"].items():
             pid = participants.get(name)
             if pid is None:
-                print(f"  Skipping {expense['description']!r}: unknown "
+                print(f"  Skipping {expense['date'].date()} {label}: unknown "
                       f"participant {name!r}")
                 missing = True
                 break
@@ -274,7 +338,8 @@ def main():
                       else SplitMode.BY_AMOUNT)
         category_id = resolve_category(expense["category"], categories, category_mapping)
 
-        expense_id = client.add_expense(
+        expense_id = create_expense(
+            client,
             title=expense["description"],
             amount=expense["cost_cents"],
             paid_by=payer_id,
@@ -282,9 +347,11 @@ def main():
             split_mode=split_mode,
             expense_date=expense["date"],
             category=category_id,
+            is_reimbursement=expense["is_reimbursement"],
         )
+        tag = "PAYMENT" if expense["is_reimbursement"] else expense["split_mode"]
         print(f"  Added {expense['date'].date()} {expense['description']!r} "
-              f"[{expense['split_mode']}] -> {expense_id}")
+              f"${expense['cost_cents'] / 100:.2f} [{tag}] -> {expense_id}")
         created += 1
 
     print(f"\nDone: {created} expense(s) added, {skipped} skipped.")
