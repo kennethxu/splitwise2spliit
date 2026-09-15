@@ -8,7 +8,7 @@ group.
 | File | Purpose |
 |---|---|
 | `spliit_api.py` | Shared client -- talks to Spliit's tRPC API directly. Required by the other scripts. |
-| `import_splitwise_csv.py` | Bulk-import expenses from a Splitwise CSV export into a Spliit group. |
+| `import_splitwise_csv.py` | Bulk-import expenses from a Splitwise CSV export into a new or existing Spliit group. |
 | `wipe_spliit_expenses.py` | Delete all expenses in a Spliit group, to start clean. |
 | `category_mapping.json` | Splitwise -> Spliit category name mapping, used by the import script. |
 
@@ -19,28 +19,43 @@ pip install requests
 ```
 
 `spliit_api.py` must be in the same directory as the scripts below -- they
-import it as a local module, not a package.
+import it as a local module, not a package. `requests` is the only external
+dependency; there's no third-party Spliit client library involved.
 
 ---
 
 ## import_splitwise_csv.py
 
-Reads a Splitwise CSV export and creates the equivalent expenses in an
-existing Spliit group.
+Reads a Splitwise CSV export and creates the equivalent expenses in a Spliit
+group -- either an existing one or a brand new one created on the fly.
 
 ### Usage
 
 ```
+# Import into an existing group
 python import_splitwise_csv.py GROUP_ID path/to/export.csv
 python import_splitwise_csv.py GROUP_ID path/to/export.csv --server-url https://spliit.mydomain.com
+
+# Create a new group and import into it
+python import_splitwise_csv.py --create-group "Banff Trip" path/to/export.csv
+python import_splitwise_csv.py --create-group "Banff Trip" --currency "$" path/to/export.csv
 ```
 
 - `GROUP_ID` is the last segment of the group's URL, e.g.
-  `spliit.app/RrYePXN2GBpSMW1EPjpjH` -> `RrYePXN2GBpSMW1EPjpjH`.
+  `spliit.app/groups/RrYePXN2GBpSMW1EPjpjH` -> `RrYePXN2GBpSMW1EPjpjH`.
+  Pass exactly one of `GROUP_ID` or `--create-group NAME` -- not both, not
+  neither.
+- `--create-group NAME` creates a new group with that name instead of
+  importing into an existing one. Its participants are seeded directly from
+  the CSV's header row, in one call, before any expenses are imported.
+  `--currency` (default `$`) sets the new group's currency symbol.
 - `--server-url` defaults to `https://spliit.app`; set it for a self-hosted
   instance.
-- Participant names in the CSV header must exactly match the names already
-  in the Spliit group -- this doesn't create new people.
+- Participant names in the CSV are matched exactly against the group's
+  existing participants. A name that doesn't match is **added to the group
+  automatically** (see "Participant handling" below) unless
+  `--no-create-participants` is passed, in which case that expense is
+  skipped instead.
 
 ### Expected CSV format
 
@@ -80,15 +95,30 @@ A few rules apply on top of that reconstruction:
 - **Even splits use `SplitMode.EVENLY`.** If every remaining participant's
   share is within a cent of each other, the expense is added as an even
   split instead of exact per-person amounts. A 1-cent spread is normal --
-  it's just the leftover cent(s) from dividing a cost by N -- so this
-  matches what "split equally" in the Spliit UI would produce, and avoids
-  cent-level rounding noise. Genuinely uneven splits still use
+  it's just the leftover cent(s) from dividing a cost by N -- so this is
+  compared at the cent (integer) level rather than as dollar-floats, which
+  avoids floating-point boundary noise that could otherwise misclassify an
+  even split as uneven. Genuinely uneven splits still use
   `SplitMode.BY_AMOUNT` with exact cents.
 - **"Payment" rows become settlements, not expenses.** A row whose
   Category is `Payment` is a Splitwise settle-up (one person directly
   repaying another), not a purchase. These are created with
   `isReimbursement=True` so they net out balances correctly instead of
   showing up as a line-item expense.
+
+### Participant handling
+
+A name in the CSV that isn't already a participant in the Spliit group is
+added to the group automatically (via the same request the group's
+"Edit" screen uses). This is on by default; pass
+`--no-create-participants` to skip those expenses instead, with a warning,
+if you'd rather add people manually.
+
+A newly added participant's id is cached for the rest of the run, so if
+the same new name appears in several rows it's only created once. When
+using `--create-group`, every name in the CSV header is seeded into the
+group at creation time instead, so this mainly comes up for
+`GROUP_ID`-based imports into a group that doesn't yet have everyone.
 
 ### Category mapping
 
@@ -119,9 +149,14 @@ For each expense, a line like:
 amount is included specifically to help distinguish duplicate titles on
 the same or different days (e.g. multiple "Gas" stops on a trip).
 
-Rows that can't be imported (unknown payer/participant name, ambiguous
-multi-payer rows) are skipped with a warning and don't stop the run. A
-summary count of added/skipped is printed at the end.
+Rows that can't be imported (unknown payer/participant name when
+`--no-create-participants` is set, ambiguous multi-payer rows) are skipped
+with a warning and don't stop the run. The run ends with a summary line
+including a direct link to the group:
+
+```
+Done: 17 expense(s) added, 0 skipped to group: https://spliit.app/groups/llKlrlQLitFxPmKv4TBXU
+```
 
 ---
 
@@ -144,7 +179,8 @@ python wipe_spliit_expenses.py GROUP_ID --server-url https://spliit.mydomain.com
 
 1. Always fetches and prints every expense in the group first (date,
    amount, payer, title), so you can see exactly what's about to be
-   deleted.
+   deleted. This follows pagination internally, so it covers the whole
+   group regardless of size.
 2. Without `--yes`, you must type `DELETE ALL` exactly to proceed --
    anything else aborts with nothing deleted.
 3. `--dry-run` lists only and never deletes, regardless of `--yes`.
