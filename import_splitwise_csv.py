@@ -2,7 +2,7 @@
 Bulk-import expenses from a Splitwise CSV export into an existing Spliit group.
 
 Setup:
-    pip install spliit_client requests
+    pip install requests
 
 Usage:
     python import_splitwise_csv.py GROUP_ID path/to/export.csv
@@ -30,9 +30,6 @@ Rows whose Category is "Payment" are Splitwise settle-up transactions (one
 person directly repaying another), not real expenses. These are imported as
 Spliit reimbursements (isReimbursement=True) rather than ordinary expenses,
 so they net out balances the same way instead of showing up as a purchase.
-spliit_client's add_expense() always sends isReimbursement=False with no way
-to override it, so this script posts those rows to the API itself -- see
-`create_expense()`.
 
 Two refinements on top of the raw reconstruction:
   1. Participants whose computed share comes out to (effectively) zero are
@@ -51,14 +48,13 @@ matching Spliit category; that choice is saved to category_mapping.json
 immediately, so future runs use it automatically without asking again.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 import argparse
 import csv
 import json
 import os
 
-import requests
-from spliit_client import Spliit, SplitMode
+from spliit_api import Spliit, SplitMode, get_categories
 
 DEFAULT_SERVER_URL = "https://spliit.app"
 
@@ -76,65 +72,6 @@ EQUAL_SHARE_SPREAD_CENTS = 1
 # A computed share smaller than this (in dollars) is treated as zero and
 # the participant is dropped from the split.
 ZERO_SHARE_TOLERANCE = 0.005
-
-
-def get_categories(server_url: str = DEFAULT_SERVER_URL) -> dict:
-    resp = requests.get(f"{server_url}/api/trpc/categories.list", timeout=10)
-    resp.raise_for_status()
-    payload = resp.json()["result"]["data"]
-    if isinstance(payload, dict) and "json" in payload:
-        payload = payload["json"]
-    return {c["name"]: c["id"] for c in payload["categories"]}
-
-
-def create_expense(client: Spliit, title: str, amount: int, paid_by: str,
-                    paid_for: list, split_mode: SplitMode,
-                    expense_date: datetime = None, notes: str = "",
-                    category: int = 0, is_reimbursement: bool = False) -> str:
-    """
-    Add an expense, or a settlement payment when is_reimbursement=True.
-
-    This mirrors spliit_client.Spliit.add_expense() exactly, with one
-    difference: that method hardcodes isReimbursement=False in the request
-    it sends, with no parameter to change it, so a settle-up payment can't
-    be created through it. This posts the same request directly, letting
-    is_reimbursement flow through.
-    """
-    if expense_date is None:
-        expense_date = datetime.now(timezone.utc)
-
-    formatted_paid_for = [{"participant": pid, "shares": shares} for pid, shares in paid_for]
-    formatted_date = (expense_date.strftime("%Y-%m-%dT%H:%M:%S.")
-                      + f"{expense_date.microsecond // 10000:03d}Z")
-
-    expense_form_values = {
-        "expenseDate": formatted_date,
-        "title": title,
-        "category": category,
-        "amount": amount,
-        "paidBy": paid_by,
-        "paidFor": formatted_paid_for,
-        "splitMode": split_mode.value,
-        "saveDefaultSplittingOptions": False,
-        "isReimbursement": is_reimbursement,
-        "documents": [],
-        "notes": notes,
-    }
-    json_data = {
-        "0": {
-            "json": {
-                "groupId": client.group_id,
-                "expenseFormValues": expense_form_values,
-                "participantId": "None",
-            },
-            "meta": {"values": {"expenseFormValues.expenseDate": ["Date"]}},
-        }
-    }
-
-    resp = requests.post(f"{client.base_url}/groups.expenses.create",
-                          params={"batch": "1"}, json=json_data)
-    resp.raise_for_status()
-    return resp.content.decode()
 
 
 def load_category_mapping(path: str = CATEGORY_MAPPING_FILE) -> dict:
@@ -338,8 +275,7 @@ def main():
                       else SplitMode.BY_AMOUNT)
         category_id = resolve_category(expense["category"], categories, category_mapping)
 
-        expense_id = create_expense(
-            client,
+        expense_id = client.add_expense(
             title=expense["description"],
             amount=expense["cost_cents"],
             paid_by=payer_id,

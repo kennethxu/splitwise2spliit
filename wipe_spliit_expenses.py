@@ -2,7 +2,7 @@
 Delete ALL expenses in an existing Spliit group -- for starting clean.
 
 Setup:
-    pip install spliit_client
+    pip install requests
 
 Usage:
     python wipe_spliit_expenses.py GROUP_ID                # lists, asks for
@@ -15,47 +15,17 @@ This is IRREVERSIBLE -- Spliit has no trash/undo for deleted expenses.
 """
 
 import argparse
-import json
 import sys
 
-import requests
-from spliit_client import Spliit
+from spliit_api import Spliit
 
 DEFAULT_SERVER_URL = "https://spliit.app"
 
 CONFIRM_PHRASE = "DELETE ALL"
 
 
-def list_all_expenses(client: Spliit) -> list:
-    """Fetch every expense in the group, following pagination.
-
-    spliit_client's own get_expenses() calls groups.expenses.list with no
-    cursor and just returns whatever comes back -- but the server paginates
-    that endpoint (10 per page), so it silently only returns the first
-    page. This walks the hasMore/nextCursor fields itself to get everything.
-    """
-    all_expenses = []
-    cursor = None
-    while True:
-        query = {"groupId": client.group_id}
-        if cursor is not None:
-            query["cursor"] = cursor
-        params = {
-            "batch": "1",
-            "input": json.dumps({"0": {"json": query}}),
-        }
-        resp = requests.get(f"{client.base_url}/groups.expenses.list", params=params)
-        resp.raise_for_status()
-        data = resp.json()[0]["result"]["data"]["json"]
-        all_expenses.extend(data["expenses"])
-        if not data.get("hasMore"):
-            break
-        cursor = data["nextCursor"]
-    return all_expenses
-
-
 def list_expenses(client: Spliit) -> list:
-    expenses = list_all_expenses(client)
+    expenses = client.get_expenses()  # follows pagination internally
     # Most recent first, just for readability
     expenses.sort(key=lambda e: e.get("expenseDate", ""), reverse=True)
     return expenses
