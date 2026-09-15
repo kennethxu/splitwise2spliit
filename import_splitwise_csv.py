@@ -7,6 +7,8 @@ Setup:
 Usage:
     python import_splitwise_csv.py GROUP_ID path/to/export.csv
     python import_splitwise_csv.py GROUP_ID path/to/export.csv --server-url https://spliit.mydomain.com
+    python import_splitwise_csv.py --create-group "Banff Trip" path/to/export.csv
+    python import_splitwise_csv.py --create-group "Banff Trip" --currency "$" path/to/export.csv
 
 Expected CSV format (Splitwise's "Export as CSV"):
 
@@ -259,22 +261,54 @@ def get_or_create_participant(client: Spliit, participants: dict, name: str,
     return pid
 
 
+def read_csv_participant_names(csv_path: str) -> list:
+    """Read just the header row and return the participant column names
+    (everything after Date,Description,Category,Cost,Currency)."""
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        header = next(csv.reader(f))
+    return [h.strip() for h in header[5:]]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("group_id", help="The Spliit group ID to import into "
-                                          "(the last segment of the group's URL)")
+    parser.add_argument("group_id", nargs="?", default=None,
+                         help="The Spliit group ID to import into (the last "
+                              "segment of the group's URL). Omit this and use "
+                              "--create-group instead to import into a brand "
+                              "new group.")
     parser.add_argument("csv_path", help="Path to the Splitwise CSV export")
     parser.add_argument("--server-url", default=DEFAULT_SERVER_URL,
                          help=f"Spliit server URL (default: {DEFAULT_SERVER_URL})")
     parser.add_argument("--no-create-participants", action="store_true",
                          help="Skip expenses referencing an unknown participant "
                               "instead of adding them to the group")
+    parser.add_argument("--create-group", metavar="NAME",
+                         help="Create a new group with this name instead of "
+                              "importing into an existing one (mutually "
+                              "exclusive with GROUP_ID). Its participants are "
+                              "seeded from the CSV's header row.")
+    parser.add_argument("--currency", default="$",
+                         help="Currency symbol for --create-group (default: $)")
     args = parser.parse_args()
 
-    client = Spliit(group_id=args.group_id, server_url=args.server_url)
-    group = client.get_group()
-    print(f"Connected to group: {group['name']} ({group['currency']})  [{args.group_id}]")
+    if bool(args.group_id) == bool(args.create_group):
+        parser.error("pass exactly one of GROUP_ID or --create-group")
+
+    if args.create_group:
+        names = read_csv_participant_names(args.csv_path)
+        if not names:
+            parser.error(f"{args.csv_path!r} has no participant columns to "
+                          f"seed the new group with")
+        client = Spliit.create_group(name=args.create_group, currency=args.currency,
+                                      participants=names, server_url=args.server_url)
+        print(f"Created group {client.group_id!r}: {args.create_group} "
+              f"({args.currency}) with participants {names}")
+        print(f"  {args.server_url.rstrip('/')}/groups/{client.group_id}")
+    else:
+        client = Spliit(group_id=args.group_id, server_url=args.server_url)
+        group = client.get_group()
+        print(f"Connected to group: {group['name']} ({group['currency']})  [{args.group_id}]")
 
     participants = client.get_participants()  # name -> id
     categories = get_categories(args.server_url)
@@ -324,7 +358,8 @@ def main():
               f"${expense['cost_cents'] / 100:.2f} [{tag}] -> {expense_id}")
         created += 1
 
-    print(f"\nDone: {created} expense(s) added, {skipped} skipped.")
+    group_url = f"{args.server_url.rstrip('/')}/groups/{client.group_id}"
+    print(f"\nDone: {created} expense(s) added, {skipped} skipped to group: {group_url}")
 
 
 if __name__ == "__main__":

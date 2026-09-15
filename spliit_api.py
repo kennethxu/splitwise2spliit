@@ -59,6 +59,73 @@ class Spliit:
     group_id: str
     server_url: str = DEFAULT_SERVER_URL
 
+    @classmethod
+    def create_group(cls, name: str, currency: str = "$",
+                      participants: Optional[List[str]] = None,
+                      currency_code: Optional[str] = None,
+                      information: Optional[str] = None,
+                      server_url: str = DEFAULT_SERVER_URL) -> "Spliit":
+        """
+        Create a new Spliit group and return a client bound to it.
+
+        Mirrors groups.create -- the same groupFormValues shape as
+        groups.update, minus the id-based update/delete diffing since
+        there's nothing existing to preserve. Confirmed against Spliit's
+        actual server-side createGroup() (src/lib/api.ts): it destructures
+        only `name` from each submitted participant and always assigns
+        its own id, so unlike add_participant this one never risks the
+        "id present but doesn't match anything" pitfall -- but participant
+        ids are still never sent here, to stay consistent with what the
+        server actually reads.
+
+        The Zod schema backing this endpoint requires at least one
+        participant, so `participants` can't be left empty.
+        """
+        if not participants:
+            raise ValueError("create_group requires at least one participant name")
+
+        group_form_values = {
+            "name": name,
+            "currency": currency,
+            "participants": [{"name": p} for p in participants],
+        }
+        if information:
+            group_form_values["information"] = information
+        if currency_code:
+            group_form_values["currencyCode"] = currency_code
+
+        json_data = {"0": {"json": {"groupFormValues": group_form_values}}}
+        base_url = urljoin(server_url, "/api/trpc")
+        resp = requests.post(f"{base_url}/groups.create",
+                              params={"batch": "1"}, json=json_data, timeout=10)
+        resp.raise_for_status()
+
+        try:
+            body = resp.json()
+            if isinstance(body, list) and body and "error" in body[0]:
+                raise RuntimeError(f"groups.create returned an error: {body[0]['error']}")
+            group_id = body[0]["result"]["data"]["json"]["groupId"]
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(
+                f"groups.create returned {resp.status_code} but the response "
+                f"didn't contain a groupId as expected. Response body: "
+                f"{resp.text[:1000]!r}"
+            ) from exc
+
+        client = cls(group_id=group_id, server_url=server_url)
+
+        # Verify the write actually took effect and every requested
+        # participant is really there, rather than trusting the response
+        # alone (see add_participant for why this matters here).
+        created = client.get_participants()
+        missing = [p for p in participants if p not in created]
+        if missing:
+            raise RuntimeError(
+                f"groups.create reported success (group {group_id}) but "
+                f"these participants are missing from it afterward: {missing}"
+            )
+        return client
+
     @property
     def base_url(self) -> str:
         return urljoin(self.server_url, "/api/trpc")
