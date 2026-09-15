@@ -82,6 +82,86 @@ class Spliit:
         group = self.get_group()
         return {p["name"]: p["id"] for p in group["participants"]}
 
+    def add_participant(self, name: str) -> str:
+        """
+        Add a new participant to the group, returning their new id.
+
+        Spliit has no dedicated "add participant" endpoint -- the group
+        settings form edits the whole group (name, currency, participant
+        list) in one groups.update mutation. So this fetches the group's
+        current participant list, appends the new person to it (existing
+        participants kept as-is, ids included), and sends the full form
+        back.
+
+        Confirmed against Spliit's actual server-side updateGroup()
+        (src/lib/api.ts): it decides "new" purely by whether a submitted
+        participant's id is undefined -- anyone WITH an id is routed to
+        updateMany (matched against an existing row; a client-made-up id
+        that matches nothing just silently updates zero rows and reports
+        success), and only entries with id truly absent go through
+        createMany, where the server assigns its own id via randomId().
+        So the new participant here is sent with id omitted entirely
+        (never a client-generated one), letting the server assign the
+        real id -- which this method then discovers by re-fetching the
+        group and looking the new name up by name.
+
+        A 200 response from this endpoint doesn't guarantee the write
+        actually took effect (tRPC can report success with the mutation
+        still a no-op, as above), so this re-fetches the group afterward
+        and confirms the new participant is really there before
+        returning -- raising with the server's response body if not.
+        """
+        group = self.get_group()
+
+        participants = [{"id": p["id"], "name": p["name"]} for p in group["participants"]]
+        participants.append({"name": name})  # no "id" -- server assigns one
+
+        group_form_values = {
+            "name": group["name"],
+            "currency": group["currency"],
+            "participants": participants,
+        }
+        if group.get("information"):
+            group_form_values["information"] = group["information"]
+        if group.get("currencyCode"):
+            group_form_values["currencyCode"] = group["currencyCode"]
+
+        json_data = {
+            "0": {
+                "json": {
+                    "groupId": self.group_id,
+                    "groupFormValues": group_form_values,
+                }
+            }
+        }
+        resp = requests.post(f"{self.base_url}/groups.update",
+                              params={"batch": "1"}, json=json_data, timeout=10)
+        resp.raise_for_status()
+
+        # tRPC can return HTTP 200 with a per-call error embedded in the
+        # batch response body, so a clean status code alone isn't proof of
+        # success -- check the body for an explicit error too.
+        try:
+            body = resp.json()
+            if isinstance(body, list) and body and "error" in body[0]:
+                raise RuntimeError(
+                    f"groups.update for participant {name!r} returned an "
+                    f"error: {body[0]['error']}"
+                )
+        except ValueError:
+            pass  # non-JSON response body; nothing more to check here
+
+        # Verify the write actually took effect, rather than trusting the
+        # response alone.
+        updated = self.get_participants()
+        if name not in updated:
+            raise RuntimeError(
+                f"groups.update for participant {name!r} returned {resp.status_code} "
+                f"but the participant isn't in the group afterward. "
+                f"Response body: {resp.text[:1000]!r}"
+            )
+        return updated[name]
+
     def get_expenses(self) -> List[Dict]:
         """Fetch every expense in the group, following pagination (the
         server paginates groups.expenses.list at ~10 per page)."""

@@ -49,6 +49,7 @@ immediately, so future runs use it automatically without asking again.
 """
 
 from datetime import datetime
+from typing import Optional
 import argparse
 import csv
 import json
@@ -145,6 +146,11 @@ def parse_expenses(csv_path: str):
               Spliit -- it just needs to be present and nonzero)
             - for BY_AMOUNT, value is the participant's share in cents,
               and all values sum exactly to cost_cents
+
+    A name in the CSV that isn't already a participant in the Spliit group
+    is added to the group automatically (see get_or_create_participant in
+    main()), unless --no-create-participants is passed, in which case that
+    expense is skipped instead.
     """
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
@@ -230,6 +236,29 @@ def parse_expenses(csv_path: str):
             }
 
 
+def get_or_create_participant(client: Spliit, participants: dict, name: str,
+                               create_missing: bool) -> Optional[str]:
+    """Look up a participant by name, creating them in the group if they
+    don't exist yet and create_missing is True. Updates `participants` in
+    place so later rows referencing the same new name reuse the same id
+    instead of creating a duplicate. Returns None (without raising) if
+    creation is disabled, or if it's attempted but fails -- the caller
+    treats that the same as "unknown participant" and skips the row."""
+    pid = participants.get(name)
+    if pid is not None:
+        return pid
+    if not create_missing:
+        return None
+    try:
+        pid = client.add_participant(name)
+    except Exception as exc:
+        print(f"  Failed to add participant {name!r} to the group: {exc}")
+        return None
+    participants[name] = pid
+    print(f"  Added new participant to group: {name!r}")
+    return pid
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -238,6 +267,9 @@ def main():
     parser.add_argument("csv_path", help="Path to the Splitwise CSV export")
     parser.add_argument("--server-url", default=DEFAULT_SERVER_URL,
                          help=f"Spliit server URL (default: {DEFAULT_SERVER_URL})")
+    parser.add_argument("--no-create-participants", action="store_true",
+                         help="Skip expenses referencing an unknown participant "
+                              "instead of adding them to the group")
     args = parser.parse_args()
 
     client = Spliit(group_id=args.group_id, server_url=args.server_url)
@@ -247,11 +279,13 @@ def main():
     participants = client.get_participants()  # name -> id
     categories = get_categories(args.server_url)
     category_mapping = load_category_mapping()
+    create_missing = not args.no_create_participants
 
     created, skipped = 0, 0
     for expense in parse_expenses(args.csv_path):
         label = f"{expense['description']!r} (${expense['cost_cents'] / 100:.2f})"
-        payer_id = participants.get(expense["payer_name"])
+        payer_id = get_or_create_participant(client, participants,
+                                              expense["payer_name"], create_missing)
         if payer_id is None:
             print(f"  Skipping {expense['date'].date()} {label}: unknown payer "
                   f"{expense['payer_name']!r}")
@@ -260,7 +294,7 @@ def main():
 
         paid_for, missing = [], False
         for name, value in expense["shares"].items():
-            pid = participants.get(name)
+            pid = get_or_create_participant(client, participants, name, create_missing)
             if pid is None:
                 print(f"  Skipping {expense['date'].date()} {label}: unknown "
                       f"participant {name!r}")
